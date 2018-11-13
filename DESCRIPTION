@@ -1,0 +1,23 @@
+Package: gdmDev
+Version: 0.01
+Date: 2018-11-13
+Title: Functions in development
+Description: Functions used to develop GDMs
+Author: war42q
+Maintainer: Chris Ware <chris.ware@csiro.au>
+SystemRequirements: git with shell distribution
+Licence: errr
+Imports:
+                  assertthat,
+                  DescTools,
+                  gdm,
+                  magrittr,
+                  nnls,
+                  matrixStats,                  
+                  parallel,
+                  plyr,
+                  raster,
+                  Rcpp,
+                  sp,
+                  spatstat,
+RoxygenNote: 6.0.1
