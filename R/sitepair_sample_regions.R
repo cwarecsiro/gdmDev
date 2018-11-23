@@ -9,13 +9,43 @@
 #' @param nreps (int) number of times to attempt try and balance pairs 
 #' @return A list with two objects: balanced site pairs (data.frame) and a log (data.frame)
 #' @examples
+#' ap = all_pairs(1:21, 1:21)
+#' df = data.frame(LETTERS[ap$Var1], LETTERS[ap$Var2])
+#' names(df) = c('a', 'b')
+#' tg = rep(3, 21)
+#' names(tg) = LETTERS[1:21]
+#' tl = rep(0, 21)
+#' names(tl) = LETTERS[1:21]
+#' op = SelectMismatches(df$a, df$b, tl, tg)
+#' df[as.logical(op$selected), ]
 #' @export
-#' 
 #' @note Written presently only considering that case where all site pairs are to be considered. 
 #' @note But it could be applied on top of other site pair selections (random, geo-weighted). Should build this in. 
 
+
+# tab = diss
+# gen_stats = FALSE
+# percent_match = 10
+# npairs = 750000
+# force_npairs = TRUE
+# cap_within_pairs= 1000
+# gdm_format = TRUE
+# region_name = NULL
+# regions = ibra
+# field_name = 'REG_CODE_7'
+# mask = Aus.domain.mask
+# include_zeros = TRUE
+# nreps = 25
+# tolerance = 5
+# verbose = TRUE
+  
+
 sitepair_sample_regions = function(tab,
+                                   gen_stats = TRUE,
                                    percent_match = 10,
+                                   npairs = NULL,
+                                   force_npairs = TRUE,
+                                   cap_within_pairs= NULL,
                                    gdm_format = TRUE,
                                    region_name = NULL,
                                    regions = NULL,
@@ -23,8 +53,12 @@ sitepair_sample_regions = function(tab,
                                    mask = NULL,
                                    include_zeros = TRUE,
                                    nreps = 25,
-                                   threshold = 10,
+                                   tolerance = 5,
+                                   write_logs = NULL,
                                    verbose = TRUE){
+  
+  # for loggin
+  args_supplied = as.list(match.call()[-1])
   
   # FORMAT SECTION
   
@@ -183,6 +217,7 @@ sitepair_sample_regions = function(tab,
   # loop over pairs and create matches
   for(r in seq_along(regions)){
     
+    # r = 32
     r_idx = which(pairs$r1 == regions[r] | pairs$r2 == regions[r]) 
     
     if(length(r_idx)){
@@ -195,21 +230,58 @@ sitepair_sample_regions = function(tab,
       starting_matches = c(starting_matches, n_match)
       starting_mismatches = c(starting_mismatches, n_diff)
       
-      if(percent > percent_match){
-        # more matches than target percent - reduce these
-        reduce_n = reduce_matches(n_match, n_diff)
-        to_remove = sample.int(n_match, reduce_n)
-        match_df = match_df[-to_remove, ]
-        percent = 10
+      if (!gen_stats){
+        if (!is.null(cap_within_pairs)){
+          if(n_match > cap_within_pairs){
+            to_keep = sample.int(n_match, cap_within_pairs)
+            match_df = match_df[to_keep, ]
+            percent = pc(cap_within_pairs, n_diff) 
+          }
+        }
+        
+        if(percent > percent_match){
+          # more matches than target percent - reduce these
+          n_match = nrow(match_df)
+          reduce_n = reduce_matches(n_match, n_diff)
+          to_remove = sample.int(n_match, reduce_n)
+          match_df = match_df[-to_remove, ]
+          percent = 10
+        }
+        
       }
-      
+        
       n_matches = c(n_matches, nrow(match_df))
       matched = rbind(matched, match_df)
       percent_list = c(percent_list, percent)
+
     }
     if (verbose)  cat('\r', sprintf('region %s done', regions[r])) 
   }
   
+  # build log in stages
+  log = data.frame(regions = regions, 
+                   starting_within_regions = starting_matches,
+                   starting_between_regions = starting_mismatches,
+                   starting_percent_within = pc(starting_matches, 
+                                             starting_mismatches))
+                   
+  row.names(log) = NULL
+  
+  # if a summary only is called
+  if(gen_stats){
+
+    cat('gen_stats is TRUE:', 
+        '\nReturning summary log of starting matches and mismatches only', 
+        sep = '\n')
+    return(log)
+    
+  }
+  
+  # add first filer to log
+  log$first_within_sample = n_matches
+  log$percent_within_II = pc(n_matches, log$starting_between_regions)
+  
+  # targets for regions with single sites?
   if (include_zeros){
     
     zeros = which(n_matches == 0)
@@ -228,8 +300,9 @@ sitepair_sample_regions = function(tab,
   
   # set up inputs for next loop
   r1 = as.character(paste(mismatch$r1))
-  r2 = as.character(paste(mismatch$r1))
+  r2 = as.character(paste(mismatch$r2))
   targets = n_matches * 10
+  log$target_between = targets
   names(targets) = regions
   tally = rep(0, length(targets))
   names(tally) = regions
@@ -237,8 +310,17 @@ sitepair_sample_regions = function(tab,
   # second loop - returns row ids to keep
   selected = SelectMismatches(r1, r2, tally, targets)
   
+  cat('\n')
+  
   calc_percentages = pc(n_matches, selected$tally)
   
+  # if tally has not been added to (possible), calc_percentages will contain 
+  # div 0 Inf 
+  calc_percentages = ifelse(is.finite(calc_percentages), calc_percentages, 0)
+
+  log$first_between_sample = unname(selected$tally)
+  log$percent_within_III = unname(calc_percentages)
+    
   # if (!all(unname(calc_percentages) == percent_match)) {
   # 
   #   # how bad? Good to have some criteria here, but for now, just continue.
@@ -268,86 +350,156 @@ sitepair_sample_regions = function(tab,
   # 
   # }
   
-  if (!all(unname(calc_percentages) == percent_match)) {
-
-    # how bad? Good to have some criteria here, but for now, just reduce matches.
-
-    # Actually, just reduce to a given threshold.
-    # I think in the test case, this would be 10%
-
-    reduce_regions = regions[which(calc_percentages > threshold)]
-    for(r in seq_along(reduce_regions)){
-      # r = 3
-      r_idx = which(matched$r1 == reduce_regions[r] | 
-                      matched$r2 == reduce_regions[r])
-
-      ll = length(r_idx)
-      tl = selected$tally[as.character(paste(reduce_regions[r]))]
-      pc_now = pc(ll, tl)
-      
-      if(ll > 0 & pc_now > threshold){
-        reduce_by = reduce_matches(ll, tl, by = threshold)
-
-        # try and reduce only from bloated regions
-        # r_idx = which(matched$r1 == reduce_regions[r] | 
-        #                 matched$r2 == reduce_regions[r])
-        pool_r1 = unlist(lapply(reduce_regions, grep, matched$r1))
-        pool_r2 = unlist(lapply(reduce_regions, grep, matched$r2))
-        pool_idx = unique(c(pool_r1, pool_r2))
-        
-        to_rm = pool_idx[sample.int(length(pool_idx), reduce_by)]
-        matched = matched[-c(to_rm), ]
-
-      }
-
-      if (verbose)  cat('\r', sprintf('region %s matches reduced', reduce_regions[r]))
-
-    }
-
-  }
+  # I think omit this section... until I work out when it should be called. 
+  # if (!all(unname(calc_percentages) == percent_match)) {
+  # 
+  #   # how bad? Good to have some criteria here, but for now, just reduce matches.
+  # 
+  #   # Actually, just reduce to a given threshold.
+  #   # I think in the test case, this would be +- 5%
+  #   
+  #   ltol = percent_match - tolerance
+  #   utol = percent_match + tolerance
+  #   if(mean(calc_percentages) < ltol | mean(calc_percentages) > utol){
+  #     
+  #     reduce_regions = regions[which(calc_percentages > threshold)]
+  #     for(r in seq_along(reduce_regions)){
+  # 
+  #       r_idx = which(matched$r1 == reduce_regions[r] | 
+  #                       matched$r2 == reduce_regions[r])
+  # 
+  #       ll = length(r_idx)
+  #       tl = selected$tally[as.character(paste(reduce_regions[r]))]
+  #       pc_now = pc(ll, tl)
+  #       
+  #       if(ll > 0 & pc_now > threshold){
+  #         reduce_by = reduce_matches(ll, tl, by = threshold)
+  # 
+  #         # try and reduce only from bloated regions
+  #         # r_idx = which(matched$r1 == reduce_regions[r] | 
+  #         #                 matched$r2 == reduce_regions[r])
+  #         pool_r1 = unlist(lapply(reduce_regions, grep, matched$r1))
+  #         pool_r2 = unlist(lapply(reduce_regions, grep, matched$r2))
+  #         pool_idx = unique(c(pool_r1, pool_r2))
+  #         
+  #         to_rm = pool_idx[sample.int(length(pool_idx), reduce_by)]
+  #         matched = matched[-c(to_rm), ]
+  # 
+  #       }
+  # 
+  #       if (verbose)  cat('\r', sprintf('region %s matches reduced', reduce_regions[r]))
+  # 
+  #     }
+  # 
+  #   }
+  #   
+  # }
+  
+  # select
+  combined = mismatch[as.logical(selected$selected), ]
   
   # recombine
-  to_keep = as.logical(selected$selected)
-  # create more objects while testing...
-  combined = mismatch[to_keep, ]
   pairs = rbind(matched, combined)
-
+  
+  # this will only drop pairs and only when necessary
+  if(!is.null(npairs) & !force_npairs){
+    
+    # Drop pairs to meet npairs target 
+    
+    if (nrow(pairs) > npairs){
+      
+      to_drop = sample.int(nrow(pairs), nrow(pairs) - npairs)
+      pairs = pairs[-c(to_drop), ]
+      
+    } 
+    
+  }
+  
+  # add more pairs if required
+  if(!is.null(npairs) & force_npairs){
+    
+    # check pair number
+    if(nrow(pairs) < npairs){
+      
+      # reselect from !selected$selected
+      reselect = which(selected$selected == 0)
+      
+      # sample difference from reselect
+      diff = npairs - nrow(pairs)
+      new_idx = sample(reselect, diff)
+      additional = mismatch [new_idx, ]
+      
+      # recombine
+      pairs = rbind(pairs, additional)
+      
+    }
+    
+  } 
+  
   # re-tally
   final_matches = NULL
   final_mismatches = NULL
   final_percent = NULL
   
-  for(r in seq_along(regions)){
-    
-    r_idx = which(pairs$r1 == regions[r] | pairs$r2 == regions[r]) 
-    
-    if(length(r_idx)){
-      reg_df = pairs[r_idx, ]
-      match_df = reg_df[reg_df$match, ]
-      nomatch_df = reg_df[!reg_df$match, ]
-      n_match = nrow(match_df)
-      n_diff = nrow(nomatch_df) 
-      percent = pc(n_match, n_diff) 
-      final_matches = c(final_matches, n_match)
-      final_mismatches = c(final_mismatches, n_diff)
-      
-      final_percent = c(final_percent, percent)
-      
-    }
+  # update this to work on combined table
+  for(r in regions){
+
+    m_idx = which(pairs$r1 == r & pairs$match)
+    n_idx = which(pairs$r1 == r | pairs$r2 == r & !pairs$match)
+                    
+    final_matches = c(final_matches, length(m_idx))
+    final_mismatches = c(final_mismatches, length(n_idx))
+    final_percent = c(final_percent, pc(length(m_idx), length(n_idx)))
     
   }
   
-  log = data.frame(regions = regions, 
-                   start_matches = starting_matches, 
-                   start_mismatches = starting_mismatches,
-                   start_percent = pc(starting_matches, starting_mismatches),
-                   final_matches = final_matches,
-                   final_mismatches = final_mismatches,
-                   final_percent = final_percent)
+  # recombine
+  # pairs = rbind(matched, combined)
+  
+  # if gdm format, can reshape
+  if(gdm_format){
+    names(pairs)[1:4] = names(tab)[3:6]
+    pairs = join(pairs[, 1:4], tab, by = names(tab)[3:6], match = 'first')
+    pairs = pairs[, names(tab)]
+  }
+  
+  log$final_within = final_matches
+  log$final_between = final_mismatches
+  log$final_percent = final_percent
+  log$delta_percent = log$final_percent - log$starting_percent
+  
+  if(!is.null(write_logs)){
+    tag = paste(strsplit(as.character(paste(Sys.time())), ' ')[[1]], 
+               collapse = '_')
+    tag = gsub(':', '-', tag)
+    
+    
+    
+    log_table = sprintf('%s/log_table_%s.csv', write_logs, tag)
+    write.csv(log, log_table, row.names = FALSE)
+    log_msg = sprintf('%s/log_table_%s.txt', write_logs, tag)
+    
+    # format this. TODO - add steps
+    n = names(args_supplied)
+    collect_args = NULL
+    for(i in seq_along(args_supplied)){
+      collect_args = c(collect_args, 
+                       sprintf('%s=%s', n[i], args_supplied[i]))
+    } 
+    collect_args = paste(collect_args, collapse = '\n')
+    sink(log_msg)
+    cat('USER SUPPLIED ARGUMENTS\n')
+    cat('-----------------------')
+    cat(collect_args)
+    sink()
+  }
   
   return(list(pairs = pairs, log = log))
   
 }
+
+
+
 
 # helpers
 pc = function(x, y) x/y * 100
