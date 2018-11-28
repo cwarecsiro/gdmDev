@@ -1,485 +1,94 @@
 #' @title Create site pairs balanced across regions
 #' @description Balances the number of pairs formed within and between regions 
-#' @param tab (data.frame) Table containing (minimally) site coordinates. 
-#' @param region_name (char, int, vector) Use this to specify the name(s) of the column(s) containing the region IDs if it exists. Default NULL.
-#' @param regions (raster, vector) Filepath or object with which create a regionalisation. If it's in memory, it should be of class raste, sp or sf. If on file, it needs to be able to be opened by raster, rgdal, or sf.
-#' @param field_name (char) Default NULL. Can be supplied to denote field of vector feature relating to the region to be used. 
-#' @param mask (raster) Default NULL. Must be supplied if regions is a vector feature. 
-#' @param include_zeros (bool) Relates to regions which are only represented by one site (i.e there can only be zero 'within' region pairs). If TRUE, include a single cross region pair. 
-#' @param nreps (int) number of times to attempt try and balance pairs 
+#' @param sites (data.frame) Table containing site coordinates (long, lat) and a region identifier. 
+#' @param target_pairs (int, optional). Number of requested site pairs. 
+#' @param target_ratio (float, default 0.1). Ratio of within to between regional matches.
+#' @param generate_statistics_only (bool, default FALSE). Optionally, simply calcualate parameter space.
 #' @return A list with two objects: balanced site pairs (data.frame) and a log (data.frame)
 #' @examples
-#' ap = all_pairs(1:21, 1:21)
-#' df = data.frame(LETTERS[ap$Var1], LETTERS[ap$Var2])
-#' names(df) = c('a', 'b')
-#' tg = rep(3, 21)
-#' names(tg) = LETTERS[1:21]
-#' tl = rep(0, 21)
-#' names(tl) = LETTERS[1:21]
-#' op = SelectMismatches(df$a, df$b, tl, tg)
-#' df[as.logical(op$selected), ]
+#' sites_per_region = c(0, 3, 5, 7, 9, 12)
+#' td = gen_testdata(sites_per_region)
+#' # visual
+#' plot(td$map)
+#' points(td$sites, col = 'red', pch = 19)
+#' # check parameter space only
+#' sitepair_sample_regions(td$sites, target_pairs = 250, generate_statistics_only = TRUE)
 #' @export
-#' @note Written presently only considering that case where all site pairs are to be considered. 
-#' @note But it could be applied on top of other site pair selections (random, geo-weighted). Should build this in. 
-
-
-# tab = diss
-# gen_stats = FALSE
-# percent_match = 10
-# npairs = 750000
-# force_npairs = TRUE
-# cap_within_pairs= 1000
-# gdm_format = TRUE
-# region_name = NULL
-# regions = ibra
-# field_name = 'REG_CODE_7'
-# mask = Aus.domain.mask
-# include_zeros = TRUE
-# nreps = 25
-# tolerance = 5
-# verbose = TRUE
+#' @note Presently requires numeric region 'names.' This dependency needs to be removed. 
+sitepair_sample_regions = function(sites, 
+                                   target_pairs = NULL, 
+                                   target_ratio = 0.1, 
+                                   generate_statistics_only = FALSE, 
+                                   write_sitepairs = NULL,
+                                   write_logs = NULL){
   
-
-sitepair_sample_regions = function(tab,
-                                   gen_stats = TRUE,
-                                   percent_match = 10,
-                                   npairs = NULL,
-                                   force_npairs = TRUE,
-                                   cap_within_pairs= NULL,
-                                   gdm_format = TRUE,
-                                   region_name = NULL,
-                                   regions = NULL,
-                                   field_name = NULL,
-                                   mask = NULL,
-                                   include_zeros = TRUE,
-                                   nreps = 25,
-                                   tolerance = 5,
-                                   write_logs = NULL,
-                                   verbose = TRUE){
-  
-  # for loggin
+  # for logging
   args_supplied = as.list(match.call()[-1])
+  input_table = deparse(substitute(sites))
   
-  # FORMAT SECTION
+  bounds = gen_stats(sites, target_pairs = target_pairs, 
+                     target_ratio = target_ratio,
+                     generate_statistics_only = generate_statistics_only)
   
-  EXTRACT = FALSE
-  
-  if (gdm_format) {
-    # gdm format - expecting dist, weight, long, lat, long, lat
+  if(generate_statistics_only){
     
-    # region specified?
-    if (!is.null(region_name)){
-      # check there are site 1 and site 2
-      stopifnot(length(region_name) == 2)
+    return(bounds)
+    
+  }
+  
+  # set up targets for within and between
+  targets = make_targets(bounds$output_mat, 
+                         target_pairs = target_pairs, 
+                         target_ratio = target_ratio, 
+                         n_regions = bounds$n_regions)
+  
+  # fill within
+  step1 = fill_diagonal(sites, bounds$output_mat, bounds$reg_col, 
+                        bounds$reg_names, targets$target_within, 
+                        bounds$regional_sites)
+  
+  # fill between
+  step2 = fill_between(sites, step1$filled_mat, bounds$reg_col, 
+                       bounds$reg_names, targets$target_between, 
+                       bounds$regional_sites, 
+                       step1$within_a, step1$within_b)
+  
+  # index sites and form pairs
+  s1 = sites[step2$within_a, ]
+  s2 = sites[step2$within_b, ]
+  names(s1) = paste0(names(s1), '_1')
+  names(s2) = paste0(names(s2), '_2')
+  sitepairs = cbind(s1, s2)
+  row.names(sitepairs) = NULL
+  
+  if(!is.null(write_sitepairs)){
+    
+    ext = strsplit(basename(write_sitepairs), '\\.')[[1]][2]
+    valid_ext = c('feather', 'csv', 'RData')
+    if(!ext %in% valid_ext){
+      stop(sprintf('%s is not a valid output type. Must be one of %s', 
+                   write_sitepairs, paste(valid_ext, collapse = ' ')))
+    }
       
-      r_idx = sort(unlist(lapply(region_name, grep, names(tab))))
-      
-      pairs = tab[, c(3:6, r_idx)]
-      names(pairs) = c('s1.x', 's1.y', 's2.x', 's2.y', 'r1', 'r2')
-      
-      # go to site-pair balancing
-      
-    } else {
-      # need regions for site pairs - go to extract
-      pairs = tab[, -c(1:2)]
-      names(pairs) = c('s1.x', 's1.y', 's2.x', 's2.y') 
-      EXTRACT = TRUE
-      
+    if(ext == 'feather'){
+      write_feather(sitepairs, write_sitepairs)
     }
     
-  } else {
-    # what does tab look like?
+    if(ext == 'csv'){
+      write.csv(sitepairs, write_sitepairs, row.names = FALSE)
+    }
     
-    cols = ncol(tab)
-    if (cols == 2) {
-      # sites only - expect this to be long, lat
-      
-      # ditch duplicates...
-      tab = tab[!duplicated(tab, by = names(tab)),]
-      
-      # all pairs
-      n = 1:nrow(tab)
-      pairs = all_pairs(n, n)
-      s1 = tab[pairs[, 1], ]
-      s2 = tab[pairs[, 2], ]
-      pairs = cbind(s1, s2)
-      names(pairs) = c('s1.x', 's1.y', 's2.x', 's2.y')
-      
-      EXTRACT = TRUE
-      
-    } else if (cols == 3 & !is.null(region_name)) {
-      # sites with regions - expect this to be long, lat, region
-      
-      # no dupes
-      tab = tab[!duplicated(tab, by = names(tab)[1:2]),]
-      
-      # all pairs
-      n = 1:nrow(tab)
-      pairs = all_pairs(n, n)
-      s1 = tab[pairs[, 1], ]
-      s2 = tab[pairs[, 2], ]
-      pairs = cbind(s1, s2)
-      pairs = pairs[, c(1:2, 4:5, 3, 6)]
-      names(pairs) = c('s1.x', 's1.y', 's2.x', 's2.y', 'r1', 'r2')
-      
-      # go to site-pair balancing
-      
-    } else {
-      
-      if (!is.null(region_name)) {
-        # take first two columns, and region_name - might fail...
-        if(class(region_name) == 'character'){
-          idx = grep(region_name, names(tab))
-        }
-        tab = tab[, c(1, 2, idx)]
-        tab = tab[!duplicated(tab, by = names(tab)[1:2]),]
-        
-        # all pairs
-        n = 1:nrow(tab)
-        pairs = all_pairs(n, n)
-        s1 = tab[pairs[, 1], ]
-        s2 = tab[pairs[, 2], ]
-        pairs = cbind(s1, s2)
-        pairs = pairs[, c(1:2, 4:5, 3, 6)]
-        names(pairs) = c('s1.x', 's1.y', 's2.x', 's2.y', 'r1', 'r2')
-        
-        # go to site-pair balancing
-        
-      } else {
-        # just assume to use first two columns
-        
-        # no duplicates...
-        tab = tab[!duplicated(tab, by = names(tab)[1:2]), 1:2]
-        
-        # all pairs
-        n = 1:nrow(tab)
-        pairs = all_pairs(n, n)
-        s1 = tab[pairs[, 1], ]
-        s2 = tab[pairs[, 2], ]
-        pairs = cbind(s1, s2)
-        names(pairs) = c('s1.x', 's1.y', 's2.x', 's2.y')
-        
-        EXTRACT = TRUE
-        
-      }
+    if(ext == 'RData'){
+      save(sitepairs, file = write_sitepairs)
+    }
 
-    }
-  
   }
-  
-  # EXTRACT SECTION
-  
-  if (EXTRACT){
-    
-    # determine what regions is
-    regions_class = class(regions)
-    if (length(grep('SpatialPolygonsDataFrame', regions_class))){
-      # coerce to sf and rasterize
-      regions = as(regions, 'sf')
-      regions = fasterize(regions, mask, field = field_name, fun = 'first')
-      
-    } else if(length(grep('sf', regions_class))){
-        regions = fasterize(regions, mask, field = field_name, fun = 'first')
-    }
-    # do extract
-    r1 = extract(regions, SpatialPoints(cbind(pairs$s1.x, pairs$s1.y)))
-    r2 = extract(regions, SpatialPoints(cbind(pairs$s2.x, pairs$s2.y)))
-    pairs = cbind(pairs, 'r1' = r1, 'r2' = r2)
-    
-    # NA check: TODO bolt on coordinate shifter 
-    # ditch NA rows for now
-    p1 = nrow(pairs)
-    pairs = na.omit(pairs)
-    p2 = nrow(pairs)
-    if(p1 > p2) warning(sprintf('Dropped %s NA rows', p1-p2))
-    
-  }
-  
-  # BALANCE SECTION
-  
-  # pairs formed with regions - check regional balance
-  mm = pairs$r1 - pairs$r2
-  mtch = rep(TRUE, length(mm))
-  mtch[which(mm != 0)] = FALSE
-  pairs$match = mtch
-  
-  # regions now becomes a vector unique region ids
-  regions = unique(c(pairs$r1, pairs$r2))
-  
-  # containers for outputs of first loop
-  percent_list = NULL
-  n_matches = NULL
-  matched = data.frame(matrix(nrow = 0, ncol = ncol(pairs)))
-  names(matched) = names(pairs)
-  starting_matches = NULL
-  starting_mismatches = NULL
-  
-  # loop over pairs and create matches
-  for(r in seq_along(regions)){
-    
-    # r = 32
-    r_idx = which(pairs$r1 == regions[r] | pairs$r2 == regions[r]) 
-    
-    if(length(r_idx)){
-      reg_df = pairs[r_idx, ]
-      match_df = reg_df[reg_df$match, ]
-      nomatch_df = reg_df[!reg_df$match, ]
-      n_match = nrow(match_df)
-      n_diff = nrow(nomatch_df) 
-      percent = pc(n_match, n_diff) 
-      starting_matches = c(starting_matches, n_match)
-      starting_mismatches = c(starting_mismatches, n_diff)
-      
-      if (!gen_stats){
-        if (!is.null(cap_within_pairs)){
-          if(n_match > cap_within_pairs){
-            to_keep = sample.int(n_match, cap_within_pairs)
-            match_df = match_df[to_keep, ]
-            percent = pc(cap_within_pairs, n_diff) 
-          }
-        }
-        
-        if(percent > percent_match){
-          # more matches than target percent - reduce these
-          n_match = nrow(match_df)
-          reduce_n = reduce_matches(n_match, n_diff)
-          to_remove = sample.int(n_match, reduce_n)
-          match_df = match_df[-to_remove, ]
-          percent = 10
-        }
-        
-      }
-        
-      n_matches = c(n_matches, nrow(match_df))
-      matched = rbind(matched, match_df)
-      percent_list = c(percent_list, percent)
-
-    }
-    if (verbose)  cat('\r', sprintf('region %s done', regions[r])) 
-  }
-  
-  # build log in stages
-  log = data.frame(regions = regions, 
-                   starting_within_regions = starting_matches,
-                   starting_between_regions = starting_mismatches,
-                   starting_percent_within = pc(starting_matches, 
-                                             starting_mismatches))
-                   
-  row.names(log) = NULL
-  
-  # if a summary only is called
-  if(gen_stats){
-
-    cat('gen_stats is TRUE:', 
-        '\nReturning summary log of starting matches and mismatches only', 
-        sep = '\n')
-    return(log)
-    
-  }
-  
-  # add first filer to log
-  log$first_within_sample = n_matches
-  log$percent_within_II = pc(n_matches, log$starting_between_regions)
-  
-  # targets for regions with single sites?
-  if (include_zeros){
-    
-    zeros = which(n_matches == 0)
-    if(length(zeros)){
-      n_matches[zeros] = 1
-    }
-    
-  }
-  
-  # mismatches
-  mismatch = pairs[pairs$match == FALSE, ]
-  
-  # randomize 
-  random_idx = sample.int(nrow(mismatch), nrow(mismatch))
-  mismatch = mismatch[random_idx, ]
-  
-  # set up inputs for next loop
-  r1 = as.character(paste(mismatch$r1))
-  r2 = as.character(paste(mismatch$r2))
-  targets = n_matches * 10
-  log$target_between = targets
-  names(targets) = regions
-  tally = rep(0, length(targets))
-  names(tally) = regions
-  
-  # second loop - returns row ids to keep
-  selected = SelectMismatches(r1, r2, tally, targets)
-  
-  cat('\n')
-  
-  calc_percentages = pc(n_matches, selected$tally)
-  
-  # if tally has not been added to (possible), calc_percentages will contain 
-  # div 0 Inf 
-  calc_percentages = ifelse(is.finite(calc_percentages), calc_percentages, 0)
-
-  log$first_between_sample = unname(selected$tally)
-  log$percent_within_III = unname(calc_percentages)
-    
-  # if (!all(unname(calc_percentages) == percent_match)) {
-  # 
-  #   # how bad? Good to have some criteria here, but for now, just continue.
-  # 
-  #   # reduce > 75% quartile of n_matches by 10%
-  # 
-  #   upper_quartile = unname(quantile(n_matches)['75%'])
-  #   #upper_quartile = unname(quantile(final_matches)['75%'])
-  #   reduce_regions = regions[which(n_matches >= upper_quartile)]
-  #   for(r in seq_along(reduce_regions)){
-  # 
-  #     r_idx = which(matched$r1 == reduce_regions[r] | matched$r2 == reduce_regions[r])
-  # 
-  #     if(length(r_idx)){
-  #       fact = floor(0.1 * length(r_idx))
-  #       to_rm = sample.int(length(r_idx), fact)
-  #       matched = matched[-c(to_rm), ]
-  # 
-  #       final_matches[as.character(paste(reduce_regions[r]))] =
-  #         final_matches[as.character(paste(reduce_regions[r]))] - fact
-  # 
-  #     }
-  # 
-  #     if (verbose)  cat('\r', sprintf('region %s re-calculated', reduce_regions[r]))
-  # 
-  #   }
-  # 
-  # }
-  
-  # I think omit this section... until I work out when it should be called. 
-  # if (!all(unname(calc_percentages) == percent_match)) {
-  # 
-  #   # how bad? Good to have some criteria here, but for now, just reduce matches.
-  # 
-  #   # Actually, just reduce to a given threshold.
-  #   # I think in the test case, this would be +- 5%
-  #   
-  #   ltol = percent_match - tolerance
-  #   utol = percent_match + tolerance
-  #   if(mean(calc_percentages) < ltol | mean(calc_percentages) > utol){
-  #     
-  #     reduce_regions = regions[which(calc_percentages > threshold)]
-  #     for(r in seq_along(reduce_regions)){
-  # 
-  #       r_idx = which(matched$r1 == reduce_regions[r] | 
-  #                       matched$r2 == reduce_regions[r])
-  # 
-  #       ll = length(r_idx)
-  #       tl = selected$tally[as.character(paste(reduce_regions[r]))]
-  #       pc_now = pc(ll, tl)
-  #       
-  #       if(ll > 0 & pc_now > threshold){
-  #         reduce_by = reduce_matches(ll, tl, by = threshold)
-  # 
-  #         # try and reduce only from bloated regions
-  #         # r_idx = which(matched$r1 == reduce_regions[r] | 
-  #         #                 matched$r2 == reduce_regions[r])
-  #         pool_r1 = unlist(lapply(reduce_regions, grep, matched$r1))
-  #         pool_r2 = unlist(lapply(reduce_regions, grep, matched$r2))
-  #         pool_idx = unique(c(pool_r1, pool_r2))
-  #         
-  #         to_rm = pool_idx[sample.int(length(pool_idx), reduce_by)]
-  #         matched = matched[-c(to_rm), ]
-  # 
-  #       }
-  # 
-  #       if (verbose)  cat('\r', sprintf('region %s matches reduced', reduce_regions[r]))
-  # 
-  #     }
-  # 
-  #   }
-  #   
-  # }
-  
-  # select
-  combined = mismatch[as.logical(selected$selected), ]
-  
-  # recombine
-  pairs = rbind(matched, combined)
-  
-  # this will only drop pairs and only when necessary
-  if(!is.null(npairs) & !force_npairs){
-    
-    # Drop pairs to meet npairs target 
-    
-    if (nrow(pairs) > npairs){
-      
-      to_drop = sample.int(nrow(pairs), nrow(pairs) - npairs)
-      pairs = pairs[-c(to_drop), ]
-      
-    } 
-    
-  }
-  
-  # add more pairs if required
-  if(!is.null(npairs) & force_npairs){
-    
-    # check pair number
-    if(nrow(pairs) < npairs){
-      
-      # reselect from !selected$selected
-      reselect = which(selected$selected == 0)
-      
-      # sample difference from reselect
-      diff = npairs - nrow(pairs)
-      new_idx = sample(reselect, diff)
-      additional = mismatch [new_idx, ]
-      
-      # recombine
-      pairs = rbind(pairs, additional)
-      
-    }
-    
-  } 
-  
-  # re-tally
-  final_matches = NULL
-  final_mismatches = NULL
-  final_percent = NULL
-  
-  # update this to work on combined table
-  for(r in regions){
-
-    m_idx = which(pairs$r1 == r & pairs$match)
-    n_idx = which(pairs$r1 == r | pairs$r2 == r & !pairs$match)
-                    
-    final_matches = c(final_matches, length(m_idx))
-    final_mismatches = c(final_mismatches, length(n_idx))
-    final_percent = c(final_percent, pc(length(m_idx), length(n_idx)))
-    
-  }
-  
-  # recombine
-  # pairs = rbind(matched, combined)
-  
-  # if gdm format, can reshape
-  if(gdm_format){
-    names(pairs)[1:4] = names(tab)[3:6]
-    pairs = join(pairs[, 1:4], tab, by = names(tab)[3:6], match = 'first')
-    pairs = pairs[, names(tab)]
-  }
-  
-  log$final_within = final_matches
-  log$final_between = final_mismatches
-  log$final_percent = final_percent
-  log$delta_percent = log$final_percent - log$starting_percent
   
   if(!is.null(write_logs)){
-    tag = paste(strsplit(as.character(paste(Sys.time())), ' ')[[1]], 
-               collapse = '_')
-    tag = gsub(':', '-', tag)
     
+    dst = sprintf('%s/%s_%s', write_logs, input_table, 
+                  args_supplied$target_pairs)
     
-    
-    log_table = sprintf('%s/log_table_%s.csv', write_logs, tag)
-    write.csv(log, log_table, row.names = FALSE)
-    log_msg = sprintf('%s/log_table_%s.txt', write_logs, tag)
-    
-    # format this. TODO - add steps
     n = names(args_supplied)
     collect_args = NULL
     for(i in seq_along(args_supplied)){
@@ -487,39 +96,476 @@ sitepair_sample_regions = function(tab,
                        sprintf('%s=%s', n[i], args_supplied[i]))
     } 
     collect_args = paste(collect_args, collapse = '\n')
-    sink(log_msg)
+    
+    perc = calc_proportion(step2$filled_mat)
+    
+    nmat = data.matrix(step2$filled_mat)
+    check_within = diag(nmat)
+    check_within = ifelse(check_within < targets$target_within, FALSE, TRUE)
+    
+    diag(nmat) = NA
+    check_between = na.omit(as.vector(nmat))
+    check_between = ifelse(check_between < targets$target_between, FALSE, TRUE)
+    
+    msg = list(m0 = '------------------------------------------------------\n', 
+               m1 = sprintf('Sample set with: \n\t%s sites', nrow(sites)),
+               m2 = sprintf('\n\t%s possible pairs', N_pairs(nrow(sites))), 
+               m3 = sprintf('\n\t%s regions', bounds$n_regions), 
+               m4 = sprintf('\n\nUsing a target of %s pairs and a %s within/between ratio', 
+                            target_pairs, target_ratio),
+               m5 = sprintf('\n\taiming for %s/%s within/between pairs', 
+                            targets$target_within, targets$target_between),
+               m6 = sprintf('\n\t%s regions met their within targets (%s)', 
+                            sum(check_within), targets$target_within),
+               m7 = sprintf('\n\t%s between region combinations met their between targets (%s)', 
+                            sum(check_between), targets$target_between),
+               m8 = sprintf('\n\tFinal percentage of within pairs: %s%%', perc),
+               m8 = '\n------------------------------------------------------\n')
+    
+    sink(sprintf('%s_callsummary.txt', dst))
     cat('USER SUPPLIED ARGUMENTS\n')
-    cat('-----------------------')
+    cat('-----------------------\n')
     cat(collect_args)
+    cat('\n\nCALL SUMMARY \n')
+    for(i in msg) cat(i)
     sink()
+    
+    
+    write.csv(bounds$output_mat, sprintf('%s_MATRIX_ALLPAIRS.csv', dst), 
+              row.names = TRUE)
+    
+    write.csv(step2$filled_mat, sprintf('%s_MATRIX_SAMPLEDPAIRS.csv', dst), 
+              row.names = TRUE)
+    
   }
   
-  return(list(pairs = pairs, log = log))
+  return(list(sitepairs = sitepairs,
+              matrix_allpairs = bounds$output_mat,
+              matrix_sampledpairs = step2$filled_mat, 
+              target_within = targets$target_within, 
+              target_between = targets$target_between))
   
 }
 
 
-
-
-# helpers
-pc = function(x, y) x/y * 100
-
-reduce_mismatches = function(percent, diff){
-  fact = ceiling(10/percent)
-  reduce_to = floor(diff/fact)
-  return(diff - reduce_to)
+FormPairs_ = function(ns, indexes_only = TRUE, as_df = FALSE, 
+                      sites = NULL){
+  
+  if(!hasArg(ns)){
+    stop('Need number of sites')
+  }
+  
+  if(indexes_only & as_df){
+    stop('Cannot return indexes as both a list and a data.frame')
+  }
+  
+  pairs = FormPairs(ns)
+  
+  if(indexes_only){
+    
+    return(pairs)
+    
+  } else if (as_df){
+    
+    return(data.frame(pairs))
+    
+  } else {
+    
+    s1 = sites[pairs$pair1, ]
+    s2 = sites[pairs$pair2, ]
+    names(s1) = paste0(names(s1), '_1')
+    names(s2) = paste0(names(s2), '_2')
+    
+    return(cbind2(s1, s2))
+    
+  }
+  
 }
 
-reduce_matches = function(n_match, diff, by = 10){
-  reduce_to = ceiling(diff * (by/100))
-  return(n_match - reduce_to)
+gen_stats = function(sites, 
+                     target_pairs = NULL, 
+                     target_ratio = 0.1,
+                     generate_statistics_only = FALSE){
+  
+  reg_col = names(sites)[3]
+  tbl = table(sites[reg_col])
+  reg_names = names(tbl)
+  regional_sites = as.vector(tbl)
+  n_regions = length(reg_names)
+  
+  output_mat = data.frame(matrix(nrow = n_regions, ncol = n_regions))
+  names(output_mat) = reg_names
+  row.names(output_mat) = reg_names
+  
+  # within
+  pairs_within = sapply(regional_sites, N_pairs)
+  for (i in seq_along(reg_names)){
+    output_mat[i, i] = pairs_within[i]
+  }
+  
+  # between
+  pairs_between = list()
+  for (i in 1:(n_regions-1)){
+    n_site_i = regional_sites[i]
+    reg_i = NULL
+    for (j in (i+1):n_regions){
+      reg_i = c(reg_i, n_site_i*regional_sites[j])
+    }
+    pairs_between[[i]] = reg_i
+  }
+  
+  for (i in 1:(n_regions-1)){
+    output_mat[(i+1):n_regions, i] = unlist(pairs_between[[i]])
+  }
+  
+  output_mat[is.na(output_mat)] = ''
+  
+  if(generate_statistics_only){
+    
+    all_n = N_pairs(nrow(sites))
+    
+    if(!is.null(target_pairs)){
+      tg50 = target_pairs
+    } else {
+      tg50 = ceiling(all_n/2)
+    }
+    tr10 = ceiling(target_ratio * tg50)
+    trw = ceiling(tr10/n_regions)
+    
+    sampled_mat = output_mat
+    
+    tg_within = NULL
+    for(i in 1:ncol(output_mat)){
+      ii = as.numeric(output_mat[i,i])
+      tg_within = c(tg_within, ii >= trw)
+      
+      if(ii < trw){
+        sampled_mat[i,i] = ii
+      } else{
+        sampled_mat[i,i] = trw
+      }
+      
+    }
+    
+    trb = ceiling((tg50-tr10)/N_pairs(n_regions))
+    
+    # rounding might make these number not add up...
+    tg50 = trb * N_pairs(n_regions) + n_regions * trw
+    
+    tg_between = NULL
+    for(i in 1:(ncol(output_mat)-1)){
+      
+      for(j in (i+1):nrow(output_mat)){
+        
+        ij = as.numeric(output_mat[j,i])
+        tg_between = c(tg_between, ij >= trb)
+        
+        if(ij < trb){
+          sampled_mat[j,i] = ij
+        } else{
+          sampled_mat[j,i] = trb
+        }
+          
+      }
+      
+    }
+    
+    perc = calc_proportion(sampled_mat)
+    
+    msg = list(m0 = '------------------------------------------------------\n', 
+               m1 = sprintf('Sample set with: \n\t%s sites', nrow(sites)),
+               m2 = sprintf('\n\t%s possible pairs', all_n), 
+               m3 = sprintf('\n\t%s regions', n_regions), 
+               m4 = sprintf('\n\nUsing a target of %s pairs and a %s within/between ratio', tg50, target_ratio),
+               m5 = sprintf('\n\taiming for %s pairs: %s/%s', tg50, n_regions*trw, N_pairs(n_regions)*trb),
+               m6 = sprintf('\n\t%s regions would meet their within targets (%s)', 
+                            sum(tg_within), trw),
+               m7 = sprintf('\n\t%s between region combinations would meet their between targets (%s)', 
+                            sum(tg_between), trb),
+               m8 = sprintf('\n\tFinal percentage of within pairs: %s%%', perc),
+               m8 = '\n------------------------------------------------------\n')
+    
+    for(i in msg) cat(i)
+    
+    return(list(matrix_allpairs = output_mat))
+    
+  } else {
+    
+    return(list(output_mat = output_mat, 
+                reg_names = reg_names,
+                n_regions = n_regions,
+                regional_sites = regional_sites,
+                reg_col = reg_col))
+  }
+  
+  
 }
 
-all_pairs <- function(a, b){
-  allpairs <- data.table(expand.grid(a, b))
-  allpairs <- data.frame(allpairs[allpairs[, .I[1], by = list(pmin(Var1, Var2), 
-                                                              pmax(Var1, Var2))]$V1])
-  del <- which(allpairs$Var1 == allpairs$Var2)
-  unique_pairs <- allpairs[-del,]
-  return(unique_pairs)
+N_pairs = function(n) ((n^2)-n)/2
+
+make_targets = function(output_mat, target_pairs, target_ratio, n_regions){
+  
+  target_within = target_pairs * target_ratio
+  target_region = ceiling(target_within/n_regions)
+  target_between = ceiling((target_pairs-target_within) / N_pairs(n_regions))
+  
+  return(list(target_within = target_region,
+              target_between = target_between))
+  
+}
+
+fill_diagonal = function(sites, output_mat, reg_col, reg_names, target_within, 
+                         regional_sites){
+
+  # output_mat = bounds$output_mat
+  # reg_names = bounds$reg_names
+  # target_within = targets$target_within
+  # regional_sites = bounds$regional_sites
+  
+  
+  filled_mat = output_mat
+  
+  within_a = NULL
+  within_b = NULL
+  
+  for(i in 1:nrow(output_mat)){
+    
+    # i = 4
+    # reg_col = 'region'
+    
+    reg_i = reg_names[i]
+    
+    possible = as.numeric(output_mat[i,i])
+    
+    if(possible != 0){
+      
+      rows_i = which(sites[reg_col] == reg_i)
+      
+      ns = regional_sites[i]
+      pairs_i = FormPairs_(ns, indexes_only = TRUE)
+      
+      if(possible <= target_within){
+        
+        # take all
+        idx = rows_i[pairs_i$pair1]
+        within_a = c(within_a, idx)
+        idx = rows_i[pairs_i$pair2]
+        within_b = c(within_b, idx)
+        
+        filled = length(idx)
+        
+        
+      } else {
+        
+        # sample
+        sample_idx = sample.int(as.numeric(possible), target_within)
+        idx = rows_i[pairs_i$pair1[sample_idx]]
+        within_a = c(within_a, idx)
+        idx = rows_i[pairs_i$pair2[sample_idx]]
+        within_b = c(within_b, idx)
+        
+        filled = length(idx)
+        
+      }
+      
+    } else {
+      
+      filled = 0
+      
+    }
+    
+    filled_mat[i, i] = filled
+    
+  }  
+  
+  return(list(filled_mat = filled_mat, 
+              within_a = within_a, 
+              within_b = within_b))
+  
+}
+
+fill_between = function(sites, filled_mat, reg_col, reg_names, target_between, 
+                         regional_sites, within_a, within_b){
+  
+  # filled_mat = step1$filled_mat
+  # reg_names = bounds$reg_names
+  # target_between = 5
+  # regional_sites = bounds$regional_sites
+  
+  for(i in 1:(ncol(filled_mat)-1)){
+    
+    # i = 2
+    reg_i = reg_names[i]
+    
+    for(j in (i + 1):nrow(filled_mat)){
+      
+      # j = i + 1
+      possible = as.numeric(filled_mat[j,i])
+      reg_j = reg_names[j]
+      
+      rows_ij = which(sites[reg_col] == reg_i | 
+                        sites[reg_col] == reg_j)
+      
+      regions_ij = sites[rows_ij, reg_col]
+      
+      pairs_ij = FormPairs2(regions_ij, possible)
+      
+      if(possible <= target_between){
+        
+        # take all
+        idx = rows_ij[pairs_ij$pair1]
+        within_a = c(within_a, idx)
+        idx = rows_ij[pairs_ij$pair2]
+        within_b = c(within_b, idx)
+        
+        filled = length(idx)
+        
+        
+      } else {
+        
+        # sample
+        sample_idx = sample.int(as.numeric(possible), target_between)
+        idx = rows_ij[pairs_ij$pair1[sample_idx]]
+        within_a = c(within_a, idx)
+        idx = rows_ij[pairs_ij$pair2[sample_idx]]
+        within_b = c(within_b, idx)
+        
+        filled = length(idx)
+        
+      }
+      
+      filled_mat[j, i] = filled
+      
+    }
+    
+  }  
+  
+  return(list(filled_mat = filled_mat, 
+              within_a = within_a, 
+              within_b = within_b))
+  
+}
+
+gen_testdata = function(sites_per_region){
+  
+  ll = length(sites_per_region)
+  
+  N = ceiling(sqrt(ll))
+  rec = ll %% N
+  while(!rec == 0){
+    N = N+1
+    rec = ll %% N
+  }
+  nr = ll/N
+  rast = raster(nrow = nr, ncol = N)
+  
+  rast[] = 1:ll
+  
+  polys = rasterToPolygons(rast)
+  bbs = lapply(polys@polygons, bbox)
+  points = data.frame(matrix(nrow = 0, ncol = 2))
+  names(points) = c('x', 'y')
+  
+  for (i in seq_along(sites_per_region)){
+    
+    x = runif(sites_per_region[i], bbs[[i]][1,1], bbs[[i]][1,2])
+    y = runif(sites_per_region[i],  bbs[[i]][2,1], bbs[[i]][2,2])
+    
+    points = rbind(points, data.frame(x, y))  
+    
+  }
+  
+  points$region = extract(rast, points)
+  
+  plot(rast, legend = FALSE)
+  points(points, pch = 19, col = 'red')
+  
+  return(list(sites = points, map = rast))
+  
+}
+
+add_region = function(sites, regions, force_values = TRUE){
+  
+  regions_class = class(regions)
+  if (length(grep('SpatialPolygonsDataFrame', regions_class))){
+    # coerce to sf and rasterize
+    regions = as(regions, 'sf')
+    regions = fasterize(regions, mask, field = field_name, fun = 'first')
+    
+  } else if(length(grep('sf', regions_class))){
+    regions = fasterize(regions, mask, field = field_name, fun = 'first')
+  }
+  # do extract
+  reg = extract(regions, SpatialPoints(sites))
+  
+  # coord shifter...
+  if(force_values){
+    
+    if(anyNA(reg)){
+      
+      na_idx = which(is.na(reg))
+      na_coords = SpatialPoints(sites[na_idx, ])
+      
+      buff_width = res(regions)[1]
+      if(length(grep('+proj=longlat', crs(regions)))){
+        buff_width = buff_width * 100000
+      }
+      
+      valid = NULL
+      suppressWarnings(
+        
+        for (i in seq_along(na_coords)){
+          #i = 1
+          check = FALSE
+          while(!check){
+            
+            fish = extract(regions, buffer(na_coords[i], buff_width))[[1]]
+            if(any(!is.na(fish))){
+              valid = c(valid, na.omit(fish)[1])
+              check = TRUE
+            
+            } else {
+              
+              buff_width  = buff_width * 2
+                
+            }
+            
+          }
+        
+        }
+      
+      )
+        
+    }
+    
+    reg[na_idx] = valid
+    sites$region = reg
+  
+  } else {
+    
+    sites$region = reg
+    p1 = nrow(sites)
+    sites = na.omit(sites)
+    p2 = nrow(sites)
+    if(p1 > p2) warning(sprintf('Dropped %s NA rows', p1-p2))
+    
+  }
+  
+  return(sites)
+  
+}
+
+calc_proportion = function(df){
+  
+  xmat = data.matrix(df)
+  sum_within = 0
+  for(i in 1:ncol(xmat)){
+    sum_within = sum_within + xmat[i,i]
+    xmat[i,i] = 0
+  }
+  
+  sum_between = sum(xmat, na.rm = TRUE)
+  
+  return(sum_between / sum_within)
+  
 }
