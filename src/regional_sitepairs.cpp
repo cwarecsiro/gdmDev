@@ -60,7 +60,7 @@ List SelectMismatches(StringVector x,
       
     } 
     
-    // reset because I don't know a better way
+    // reset because I don't know any better
     ta_r1 = 0;
     ta_r2 = 0;
     tg_r1 = 0;
