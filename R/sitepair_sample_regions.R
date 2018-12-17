@@ -1,20 +1,22 @@
-#' @title Generate stratified sample of site pairs across regions
-#' @description Set targets for the number of pairs formed within and between regions 
-#' @param sites (data.frame) Table containing site coordinates (long, lat) and a region identifier. 
-#' @param target_pairs (int, optional). Number of requested site pairs. 
-#' @param target_ratio (float, default 0.1). Ratio of within to between regional matches.
-#' @param generate_statistics_only (bool, default FALSE). Optionally, simply calcualate parameter space.
-#' @return A list with two objects: balanced site pairs (data.frame) and a log (data.frame)
-#' @examples
-#' sites_per_region = c(0, 3, 5, 7, 9, 12)
-#' td = gen_testdata(sites_per_region)
-#' # visual
-#' plot(td$map)
-#' points(td$sites, col = 'red', pch = 19)
-#' # check parameter space only
-#' sitepair_sample_regions(td$sites, target_pairs = 250, generate_statistics_only = TRUE)
-#' @export
-#' @note Presently requires numeric region 'names.' This dependency needs to be removed. 
+#'@title Generate stratified sample of site pairs across regions
+# @description Set targets for the number of pairs formed within and between regions 
+#'@param sites (data.frame, filepath) Table / .CSV fp containing site coordinates (long, lat) and a region identifier. 
+#'@param target_pairs (int, optional). Number of requested site pairs. 
+#'@param target_ratio (float, default 0.1). Ratio of within to between regional matches.
+#'@param generate_statistics_only (bool, default FALSE). Optionally, simply calcualate parameter space.
+#'@return A list with two objects: balanced site pairs (data.frame) and a log (data.frame)
+#'@examples
+#'sites_per_region = c(0, 3, 5, 7, 9, 12)
+#'td = gen_testdata(sites_per_region)
+#'# visual
+#'plot(td$map)
+#'points(td$sites, col = 'red', pch = 19)
+#'# check parameter space only
+#'sitepair_sample_regions(td$sites, target_pairs = 250, generate_statistics_only = TRUE)
+#'
+#'@importFrom Rcpp evalCpp
+#'@note Presently requires numeric region 'names.' This dependency needs to be removed. 
+#'@export
 sitepair_sample_regions = function(sites, 
                                    target_pairs = NULL, 
                                    target_ratio = 0.1, 
@@ -26,6 +28,22 @@ sitepair_sample_regions = function(sites,
   args_supplied = as.list(match.call()[-1])
   input_table = deparse(substitute(sites))
   
+  # read / check sites arg
+  sites_class = class(sites)
+  in_mem = length(grep(sites_class, 'data.frame'))
+  if(in_mem == 0 & sites_class == 'character'){
+    
+    sites = tryCatch({
+      data.frame(fread(sites))  
+    }
+    )
+    
+    if(class(sites) != 'data.frame'){
+      stop(sprintf('Input table %s cannot be read', input_table))
+    }
+    
+  } 
+  
   bounds = gen_stats(sites, target_pairs = target_pairs, 
                      target_ratio = target_ratio,
                      generate_statistics_only = generate_statistics_only)
@@ -36,8 +54,7 @@ sitepair_sample_regions = function(sites,
   }
   
   # set up targets for within and between
-  targets = make_targets(bounds$output_mat, 
-                         target_pairs = target_pairs, 
+  targets = make_targets(target_pairs = target_pairs, 
                          target_ratio = target_ratio, 
                          n_regions = bounds$n_regions)
   
@@ -68,7 +85,7 @@ sitepair_sample_regions = function(sites,
       stop(sprintf('%s is not a valid output type. Must be one of %s', 
                    write_sitepairs, paste(valid_ext, collapse = ' ')))
     }
-      
+    
     if(ext == 'feather'){
       write_feather(sitepairs, write_sitepairs)
     }
@@ -80,13 +97,14 @@ sitepair_sample_regions = function(sites,
     if(ext == 'RData'){
       save(sitepairs, file = write_sitepairs)
     }
-
+    
   }
+  
   
   if(!is.null(write_logs)){
     
-    dst_params = sprintf('%s_%s_%s', input_table, 
-                  as.integer(args_supplied$target_pairs), target_ratio)
+    dst_params = sprintf('%s_%s_%sP', input_table, 
+                         as.integer(args_supplied$target_pairs), 1/target_ratio)
     
     n = names(args_supplied)
     collect_args = NULL
@@ -96,30 +114,7 @@ sitepair_sample_regions = function(sites,
     } 
     collect_args = paste(collect_args, collapse = '\n')
     
-    perc = calc_proportion(step2$filled_mat)
-    
-    nmat = data.matrix(step2$filled_mat)
-    check_within = diag(nmat)
-    check_within = ifelse(check_within < targets$target_within, FALSE, TRUE)
-    
-    diag(nmat) = NA
-    check_between = na.omit(as.vector(nmat))
-    check_between = ifelse(check_between < targets$target_between, FALSE, TRUE)
-    
-    msg = list(m0 = '------------------------------------------------------\n', 
-               m1 = sprintf('Sample set with: \n\t%s sites', nrow(sites)),
-               m2 = sprintf('\n\t%s possible pairs', N_pairs(nrow(sites))), 
-               m3 = sprintf('\n\t%s regions', bounds$n_regions), 
-               m4 = sprintf('\n\nUsing a target of %s pairs and a %s within/between ratio', 
-                            target_pairs, target_ratio),
-               m5 = sprintf('\n\taiming for %s/%s within/between pairs', 
-                            targets$target_within, targets$target_between),
-               m6 = sprintf('\n\t%s regions met their within targets (%s)', 
-                            sum(check_within), targets$target_within),
-               m7 = sprintf('\n\t%s between region combinations met their between targets (%s)', 
-                            sum(check_between), targets$target_between),
-               m8 = sprintf('\n\tFinal percentage of within pairs: %s%%', perc),
-               m8 = '\n------------------------------------------------------\n')
+    msg = gen_report(step2$filled_mat, sites, bounds$n_regions, target_pairs, targets)
     
     sink(sprintf('%s/CALL_SUMMARY_%s.txt', write_logs, dst_params))
     cat('USER SUPPLIED ARGUMENTS\n')
@@ -130,10 +125,10 @@ sitepair_sample_regions = function(sites,
     sink()
     
     write.csv(bounds$output_mat, sprintf('%s/MATRIX_ALLPAIRS_%s.csv', 
-              write_logs, dst_params), row.names = TRUE)
+                                         write_logs, dst_params), row.names = TRUE)
     
     write.csv(step2$filled_mat, sprintf('%s/MATRIX_SAMPLEDPAIRS_%s.csv', 
-              write_logs, dst_params), row.names = TRUE)
+                                        write_logs, dst_params), row.names = TRUE)
     
   }
   
@@ -145,14 +140,14 @@ sitepair_sample_regions = function(sites,
   
 }
 
-#' @title Form site pairs
-#' @description Given a number of sites, form all possible site pairs.
-#' @param ns (int, required). Number of sites with which to form pairs.
-#' @param indexes_only (bool, default TRUE). Return indexes as a list. 
-#' @param as_df (bool, default FALSE). If TRUE, return indexes as data.frame.
-#' @param sites (data.frame, optional). If supplied (and all other return options
-#' are FALSE), will construct site-pairs from the derived indexes.
-#' @export
+#'@title Form site pairs
+#'@description Given a number of sites, form all possible site pairs.
+#'@param ns (int, required). Number of sites with which to form pairs.
+#'@param indexes_only (bool, default TRUE). Return indexes as a list. 
+#'@param as_df (bool, default FALSE). If TRUE, return indexes as data.frame.
+#'@param sites (data.frame, optional). If supplied (and all other return options
+#'are FALSE), will construct site-pairs from the derived indexes.
+#'@export
 FormPairs_ = function(ns, indexes_only = TRUE, as_df = FALSE, 
                       sites = NULL){
   
@@ -187,10 +182,10 @@ FormPairs_ = function(ns, indexes_only = TRUE, as_df = FALSE,
   
 }
 
-#' @title Generate a summary of site-pair statistics
-#' @description Like a dry-run - this will return a summary of what could be 
-#' achieved given the parameter set.
-#' @export
+#'@title Generate a summary of site-pair statistics
+#'@description Like a dry-run - this will return a summary of what could be 
+#'achieved given the parameter set.
+#'@export
 gen_stats = function(sites, 
                      target_pairs = NULL, 
                      target_ratio = 0.1,
@@ -233,66 +228,15 @@ gen_stats = function(sites,
     
     all_n = N_pairs(nrow(sites))
     
-    if(!is.null(target_pairs)){
-      tg50 = target_pairs
-    } else {
-      tg50 = ceiling(all_n/2)
+    if(is.null(target_pairs)){
+      target_pairs = all_n
     }
-    tr10 = ceiling(target_ratio * tg50)
-    trw = ceiling(tr10/n_regions)
+    
+    targets = make_targets(target_pairs, target_ratio, n_regions)
     
     sampled_mat = output_mat
     
-    tg_within = NULL
-    for(i in 1:ncol(output_mat)){
-      ii = as.numeric(output_mat[i,i])
-      tg_within = c(tg_within, ii >= trw)
-      
-      if(ii < trw){
-        sampled_mat[i,i] = ii
-      } else{
-        sampled_mat[i,i] = trw
-      }
-      
-    }
-    
-    trb = ceiling((tg50-tr10)/N_pairs(n_regions))
-    
-    # rounding might make these number not add up...
-    tg50 = trb * N_pairs(n_regions) + n_regions * trw
-    
-    tg_between = NULL
-    for(i in 1:(ncol(output_mat)-1)){
-      
-      for(j in (i+1):nrow(output_mat)){
-        
-        ij = as.numeric(output_mat[j,i])
-        tg_between = c(tg_between, ij >= trb)
-        
-        if(ij < trb){
-          sampled_mat[j,i] = ij
-        } else{
-          sampled_mat[j,i] = trb
-        }
-          
-      }
-      
-    }
-    
-    perc = calc_proportion(sampled_mat)
-    
-    msg = list(m0 = '------------------------------------------------------\n', 
-               m1 = sprintf('Sample set with: \n\t%s sites', nrow(sites)),
-               m2 = sprintf('\n\t%s possible pairs', all_n), 
-               m3 = sprintf('\n\t%s regions', n_regions), 
-               m4 = sprintf('\n\nUsing a target of %s pairs and a %s within/between ratio', tg50, target_ratio),
-               m5 = sprintf('\n\taiming for %s pairs: %s/%s', tg50, n_regions*trw, N_pairs(n_regions)*trb),
-               m6 = sprintf('\n\t%s regions would meet their within targets (%s)', 
-                            sum(tg_within), trw),
-               m7 = sprintf('\n\t%s between region combinations would meet their between targets (%s)', 
-                            sum(tg_between), trb),
-               m8 = sprintf('\n\tFinal percentage of within pairs: %s%%', perc),
-               m8 = '\n------------------------------------------------------\n')
+    msg = gen_report(sampled_mat, sites, n_regions, target_pairs, targets)
     
     for(i in msg) cat(i)
     
@@ -309,24 +253,35 @@ gen_stats = function(sites,
   
 }
 
+#'@export
 N_pairs = function(n) ((n^2)-n)/2
 
-make_targets = function(output_mat, target_pairs, target_ratio, n_regions){
+#'@export
+make_targets = function(target_pairs, target_ratio, n_regions){
   
-  target_within = target_pairs * target_ratio
-  target_region = ceiling(target_within/n_regions)
-  target_between = ceiling((target_pairs-target_within) / N_pairs(n_regions))
+  # target_within = target_pairs * target_ratio
+  # target_region = ceiling(target_within/n_regions)
+  # target_between = ceiling((target_pairs-target_within) / N_pairs(n_regions))
+  
+  split_target = ceiling(target_pairs/2)
+  ratio_pm = ceiling(split_target * (target_ratio/2))
+  target_within_sum = split_target + ratio_pm
+  target_region = ceiling(target_within_sum/n_regions)
+  target_between_sum = split_target - ratio_pm
+  target_between = ceiling(target_between_sum / N_pairs(n_regions))
   
   return(list(target_within = target_region,
-              target_between = target_between))
+              target_between = target_between,
+              target_within_sum = target_within_sum,
+              target_between_sum = target_between_sum))
   
 }
 
-#' @title Fill within region quotas
-#' @export
+#'@title Fill within region quotas
+#'@export
 fill_diagonal = function(sites, output_mat, reg_col, reg_names, target_within, 
                          regional_sites){
-
+  
   # copy
   filled_mat = output_mat
   
@@ -386,10 +341,10 @@ fill_diagonal = function(sites, output_mat, reg_col, reg_names, target_within,
   
 }
 
-#' @title Fill between region quotas
-#' @export
+#'@title Fill between region quotas
+#'@export
 fill_between = function(sites, filled_mat, reg_col, reg_names, target_between, 
-                         regional_sites, within_a, within_b){
+                        regional_sites, within_a, within_b){
   
   for(i in 1:(ncol(filled_mat)-1)){
     
@@ -443,12 +398,12 @@ fill_between = function(sites, filled_mat, reg_col, reg_names, target_between,
   
 }
 
-#' @title Generate test data 
-#' @description Randomly sample x points within y regions
-#' @param sites_per_region (numeric vector, required). Vector of length y regions, 
-#' with each element specifying x points
-#' @return list: data.frame of points, and a raster object
-#' @export
+#'@title Generate test data 
+#'@description Randomly sample x points within y regions
+#'@param sites_per_region (numeric vector, required). Vector of length y regions, 
+#'with each element specifying x points
+#'@return list: data.frame of points, and a raster object
+#'@export
 gen_testdata = function(sites_per_region){
   
   ll = length(sites_per_region)
@@ -487,16 +442,16 @@ gen_testdata = function(sites_per_region){
   
 }
 
-#' @title Identify region for a given set of coordinates 
-#' @description Extracts value of a spatial surface (raster or polygons) for coordinates.
-#' @param sites (data.frame like, required). Must contain longitude and latitude. 
-#' @param regions (spatial object, required). Raster or polgons object of calss 
-#' SpatialPolygonsDataFrame, sf, or raster.
-#' @param force_values (bool, default TRUE). If TRUE, for any point that does not fall
-#' on the regions (i.e. returns NA), a nearby value will be found. 
-#' This is a very low-fi solution... If FALSE, and NA values are returned, these will be omitted.
-#' @return data.frame
-#' @export
+#'@title Identify region for a given set of coordinates 
+#'@description Extracts value of a spatial surface (raster or polygons) for coordinates.
+#'@param sites (data.frame like, required). Must contain longitude and latitude. 
+#'@param regions (spatial object, required). Raster or polgons object of calss 
+#'SpatialPolygonsDataFrame, sf, or raster.
+#'@param force_values (bool, default TRUE). If TRUE, for any point that does not fall
+#'on the regions (i.e. returns NA), a nearby value will be found. 
+#'This is a very low-fi solution... If FALSE, and NA values are returned, these will be omitted.
+#'@return data.frame
+#'@export
 add_region = function(sites, regions, force_values = TRUE){
   
   regions_class = class(regions)
@@ -536,24 +491,24 @@ add_region = function(sites, regions, force_values = TRUE){
             if(any(!is.na(fish))){
               valid = c(valid, na.omit(fish)[1])
               check = TRUE
-            
+              
             } else {
               
               buff_width  = buff_width * 2
-                
+              
             }
             
           }
-        
+          
         }
-      
-      )
         
+      )
+      
     }
     
     reg[na_idx] = valid
     sites$region = reg
-  
+    
   } else {
     
     sites$region = reg
@@ -568,10 +523,10 @@ add_region = function(sites, regions, force_values = TRUE){
   
 }
 
-#' @title Calculate proportion of within to between pairs
-#' @param df (data.frame, required). Region by region matrix with n pairs collected.
-#' @return float
-#' @export
+#'@title Calculate proportion of within to between pairs
+#'@param df (data.frame, required). Region by region matrix with n pairs collected.
+#'@return float
+#'@export
 calc_proportion = function(df){
   
   xmat = data.matrix(df)
@@ -584,5 +539,48 @@ calc_proportion = function(df){
   sum_between = sum(xmat, na.rm = TRUE)
   
   return(sum_between / sum_within)
+  
+}
+
+#'@export
+gen_report = function(mat, sites, n_regions, target_pairs, targets){
+  
+  perc = calc_proportion(mat)
+  
+  nmat = data.matrix(mat)
+  check_within = diag(nmat)
+  check_within = ifelse(check_within < targets$target_within, FALSE, TRUE)
+  
+  diag(nmat) = NA
+  check_between = na.omit(as.vector(nmat))
+  check_between = ifelse(check_between < targets$target_between, FALSE, TRUE)
+  
+  msg = list(m0 = '------------------------------------------------------\n', 
+             m1 = sprintf('Data set with: \n\t%s sites', nrow(sites)),
+             m2 = sprintf('\n\t%s regions', n_regions), 
+             m3 = sprintf('\n\t%s cross region combinations',
+                          N_pairs(n_regions)),
+             m4 = sprintf('\n\t%s possible pairs', N_pairs(nrow(sites))), 
+             m5 = sprintf('\n\nAiming for a target of %s pairs',
+                          target_pairs),
+             m6 = sprintf('\n\tAiming for %s%% more within than between pairs:', 
+                          targets$target_ratio * 100),
+             m7 = sprintf('\n\tSet target of %s within pairs', 
+                          targets$target_within_sum),
+             m8 = sprintf('\n\tSet target of %s between pairs', 
+                          targets$target_between_sum),
+             m9 = sprintf('\n\tSet target of %s within pairs per region', 
+                          targets$target_within),
+             m10 = sprintf('\n\tSet target of %s between pairs per cross region combination', 
+                          targets$target_between),
+             m11 = sprintf('\n\nCalculated:'),
+             m12 = sprintf('\n\t%s regions met their within targets (%s pairs)', 
+                           sum(check_within), targets$target_within),
+             m13 = sprintf('\n\t%s between region combinations met their between targets (%s pairs)', 
+                           sum(check_between), targets$target_between),
+             m14 = sprintf('\n\tFinal percentage of within pairs: %s%%', perc),
+             m15 = '\n------------------------------------------------------\n')
+  
+  return(msg)
   
 }
