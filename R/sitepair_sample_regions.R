@@ -34,8 +34,8 @@ sitepair_sample_regions = function(sites,
   if(in_mem == 0 & sites_class == 'character'){
     
     sites = tryCatch({
-      data.frame(fread(sites))  
-    }
+			  data.frame(fread(sites))  
+		  }
     )
     
     if(class(sites) != 'data.frame'){
@@ -257,18 +257,76 @@ gen_stats = function(sites,
 N_pairs = function(n) ((n^2)-n)/2
 
 #'@export
-make_targets = function(target_pairs, target_ratio, n_regions){
+adjust_targets = function(n_regions, target_pairs){
+  
+  # helper to apportion and adjust targets 
+  # pretty clunky...
+  
+  n_combos = N_pairs(n_regions) + n_regions
+  split_target = ceiling(target_pairs/n_combos)
+  vec = rep(split_target, n_combos)
+  
+  adjust = floor(target_ratio * vec[1])/2
+  
+  for (i in 1:n_regions){
+    vec[i] = ceiling(vec[i] + adjust)
+  }
+  
+  for (i in (n_regions+1):n_combos){
+    vec[i] = floor(vec[i] - adjust)
+  }
+  
+  on_target = sum(vec)
+  while(on_target < target_pairs){
+    for (i in 1:n_regions){
+      vec[i] = vec[i] + 1
+    }
+    on_target = sum(vec)
+  }
+  
+  targets = unique(vec)
+  return(list(target_region = max(targets),
+              target_between = min(targets)))
+  
+}
+
+#'@export
+make_targets = function(target_pairs, target_ratio, n_regions,
+                        split_global = FALSE){
   
   # target_within = target_pairs * target_ratio
   # target_region = ceiling(target_within/n_regions)
   # target_between = ceiling((target_pairs-target_within) / N_pairs(n_regions))
   
-  split_target = ceiling(target_pairs/2)
-  ratio_pm = ceiling(split_target * (target_ratio/2))
-  target_within_sum = split_target + ratio_pm
-  target_region = ceiling(target_within_sum/n_regions)
-  target_between_sum = split_target - ratio_pm
-  target_between = ceiling(target_between_sum / N_pairs(n_regions))
+  if(split_global){
+    
+    ###########################################################################
+    # Split target_pairs between available within and between regions. 
+    ###########################################################################
+    
+    split_target = ceiling(target_pairs/2)
+    ratio_pm = ceiling(split_target * (target_ratio/2))
+    target_within_sum = split_target + ratio_pm
+    target_region = ceiling(target_within_sum/n_regions)
+    target_between_sum = split_target - ratio_pm
+    target_between = ceiling(target_between_sum / N_pairs(n_regions))
+    
+  } else {
+    
+    ###########################################################################
+    # Aim here is to split the targets *almost* evenly across the number of 
+    # possible combinations of regions (inlcuding within regions). The 
+    # difference in targets calculated for within and between regions is given 
+    # by the target_ratio.
+    ###########################################################################
+    
+    # split the target_pairs across n combos and adjust for target_ratio
+    tgts = adjust_targets(n_regions, target_pairs)
+    target_region = tgts$target_region
+    target_between = tgts$target_between
+    target_within_sum = n_regions * target_region
+    target_between_sum = N_pairs(n_regions) * target_between
+  }
   
   return(list(target_within = target_region,
               target_between = target_between,
@@ -452,7 +510,7 @@ gen_testdata = function(sites_per_region){
 #'This is a very low-fi solution... If FALSE, and NA values are returned, these will be omitted.
 #'@return data.frame
 #'@export
-add_region = function(sites, regions, force_values = TRUE){
+add_region = function(sites, regions, field_name, mask, force_values = TRUE){
   
   regions_class = class(regions)
   if (length(grep('SpatialPolygonsDataFrame', regions_class))){
